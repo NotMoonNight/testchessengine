@@ -22,6 +22,15 @@ typedef struct {
     Move bestMove;
 } TTEntry;
 
+typedef struct {
+    uint64_t key;
+    int score;
+} TranspositionEntry;
+
+TranspositionEntry* transpositionTable;
+int tt_size = 0;
+int tt_score = 0;
+
 static TTEntry* transposition_table = NULL;
 
 const int pieceValues[] = { 100, 320, 330, 500, 900, 20000, -100, -320, -330, -500, -900, -20000 };
@@ -85,13 +94,14 @@ const int pst[12][64] = {
 // History heuristic: tracks how often moves cause cutoffs
 int history_table[2][64][64];
 
-int popcount64(unsigned long long x) {
-    int count = 0;
-    while (x) {
-        x &= x - 1;
-        count++;
-    }
-    return count;
+uint64_t popcount64(uint64_t x) {
+    x -= (x >> 1) & 0x5555555555555555;
+    x = (x & 0x3333333333333333) + ((x >> 2) & 0x3333333333333333);
+    x = (x + (x >> 4)) & 0x0F0F0F0F0F0F0F0F;
+    x += x >> 8;
+    x += x >> 16;
+    x += x >> 32;
+    return x & 0x7F;
 }
 
 void tt_init() {
@@ -111,6 +121,7 @@ void tt_clear() {
 
 // Store position in transposition table
 void tt_store(unsigned long long hash, int score, int depth, char flag, Move bestMove) {
+    if (!transposition_table) return;
     int index = hash & TT_MASK;
     transposition_table[index].hash = hash;
     transposition_table[index].score = score;
@@ -121,6 +132,7 @@ void tt_store(unsigned long long hash, int score, int depth, char flag, Move bes
 
 // Probe transposition table
 int tt_probe(unsigned long long hash, int depth, int alpha, int beta, int* score, Move* bestMove) {
+    if (!transposition_table) return 0;
     int index = hash & TT_MASK;
     TTEntry* entry = &transposition_table[index];
 
@@ -228,7 +240,7 @@ int search(ChessBoard* board, int depth, int alpha, int beta, int ply) {
     if (depth == 0) return quiescence(board, alpha, beta, MAX_QUIESCENCE_DEPTH);
 
     Move dummy_move = { 0, 0, ' ' };
-    int tt_score;
+    int tt_score = 0;
     if (tt_probe(board->hash, depth, alpha, beta, &tt_score, &dummy_move)) {
         return tt_score;
     }
@@ -272,7 +284,7 @@ int search(ChessBoard* board, int depth, int alpha, int beta, int ply) {
     }
 
     // Sort moves using quicksort (O(n log n) instead of bubble sort O(n²))
-    qsort(moves, movesCount, sizeof(ScoredMove), compare_moves);
+    if (movesCount > 1) qsort(moves, movesCount, sizeof(ScoredMove), compare_moves);
 
     // Null move pruning for non-endgame positions
     if (depth >= NULL_MOVE_DEPTH + 2) {
@@ -370,7 +382,7 @@ Evaluate Evaluate_findBestMove(ChessBoard* board, int max_depth, int multiPvCoun
         }
 
         // Sort root moves
-        qsort(moves, movesCount, sizeof(ScoredMove), compare_moves);
+        if (movesCount > 1) qsort(moves, movesCount, sizeof(ScoredMove), compare_moves);
 
         for (int i = 0; i < movesCount; i++) {
             ChessMoveState state;
