@@ -53,7 +53,7 @@ static inline int get_lsb(uint64_t bb) {
 void ChessBoard_setupFromFen(ChessBoard* board, const char* fen);
 int ChessBoard_makeMove(ChessBoard* board, int from, int to, char promote, ChessMoveState* state);
 void ChessBoard_unmakeMove(ChessBoard* board, ChessMoveState* state);
-uint64_t ChessBoard_getAttackers(ChessBoard* board, int sq, int side);
+void ChessBoard_updateOccupancy(ChessBoard* board);
 
 int ChessBoard_uciToSq(const char* uci);
 void ChessBoard_sqToUci(int sq, char* out);
