@@ -3,6 +3,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <intrin.h>
+#include <time.h>
 
 #include "ChessBoard.h"
 
@@ -11,8 +12,12 @@
 #define TT_EXACT 0
 #define TT_LOWER 1
 #define TT_UPPER 2
-#define MAX_QUIESCENCE_DEPTH 10
-#define NULL_MOVE_DEPTH 3
+#define MAX_QUIESCENCE_DEPTH 6
+#define NULL_MOVE_DEPTH 2
+
+static clock_t search_start_time;
+static double max_search_time = 5.0;
+static int nodes_checked = 0;
 
 typedef struct {
     unsigned long long hash;
@@ -22,19 +27,11 @@ typedef struct {
     Move bestMove;
 } TTEntry;
 
-typedef struct {
-    uint64_t key;
-    int score;
-} TranspositionEntry;
-
-TranspositionEntry* transpositionTable;
-int tt_size = 0;
-int tt_score = 0;
-
 static TTEntry* transposition_table = NULL;
 
 const int pieceValues[] = { 100, 320, 330, 500, 900, 20000, -100, -320, -330, -500, -900, -20000 };
 
+// PST (piece-square tables)
 const int pst[12][64] = {
     { 0,  0,  0,  0,  0,  0,  0,  0,
      50, 50, 50, 50, 50, 50, 50, 50,
@@ -91,7 +88,6 @@ const int pst[12][64] = {
       20, 30, 10,  0,  0, 10, 30, 20 }  // K
 };
 
-// History heuristic: tracks how often moves cause cutoffs
 int history_table[2][64][64];
 
 uint64_t popcount64(uint64_t x) {
@@ -104,9 +100,16 @@ uint64_t popcount64(uint64_t x) {
     return x & 0x7F;
 }
 
+int is_timeout() {
+    if (++nodes_checked % 2048 != 0) return 0;
+    double elapsed = (double)(clock() - search_start_time) / CLOCKS_PER_SEC;
+    return elapsed > max_search_time;
+}
+
 void tt_init() {
     if (!transposition_table) transposition_table = calloc(TT_SIZE, sizeof(TTEntry));
     memset(history_table, 0, sizeof(history_table));
+    nodes_checked = 0;
 }
 
 void tt_free() {
@@ -119,10 +122,12 @@ void tt_clear() {
     memset(history_table, 0, sizeof(history_table));
 }
 
-// Store position in transposition table
 void tt_store(unsigned long long hash, int score, int depth, char flag, Move bestMove) {
     if (!transposition_table) return;
     int index = hash & TT_MASK;
+
+    if (transposition_table[index].depth >= depth) return;
+
     transposition_table[index].hash = hash;
     transposition_table[index].score = score;
     transposition_table[index].depth = depth;
@@ -130,7 +135,6 @@ void tt_store(unsigned long long hash, int score, int depth, char flag, Move bes
     transposition_table[index].bestMove = bestMove;
 }
 
-// Probe transposition table
 int tt_probe(unsigned long long hash, int depth, int alpha, int beta, int* score, Move* bestMove) {
     if (!transposition_table) return 0;
     int index = hash & TT_MASK;
@@ -145,25 +149,21 @@ int tt_probe(unsigned long long hash, int depth, int alpha, int beta, int* score
         *score = entry->score;
         return 1;
     }
-    if (entry->flag == TT_LOWER && entry->score > alpha) {
-        alpha = entry->score;
+    if (entry->flag == TT_LOWER && entry->score >= beta) {
+        *score = entry->score;
+        return 1;
     }
-    if (entry->flag == TT_UPPER && entry->score < beta) {
-        beta = entry->score;
-    }
-
-    if (alpha >= beta) {
+    if (entry->flag == TT_UPPER && entry->score <= alpha) {
         *score = entry->score;
         return 1;
     }
     return 0;
 }
 
-// MVV-LVA (Most Valuable Victim - Least Valuable Attacker) scoring for captures
+// Most Valuable Victim - Least Valuable Attacker 
 int mvv_lva_score(ChessBoard* board, int from, int to) {
-    int victim = -1, attacker = -1;
+    int victim = -1;
 
-    // Find victim piece
     for (int i = 0; i < 12; i++) {
         if (get_bit(board->pieceBB[i], to)) {
             victim = i % 6;
@@ -171,17 +171,9 @@ int mvv_lva_score(ChessBoard* board, int from, int to) {
         }
     }
 
-    // Find attacker piece
-    for (int i = 0; i < 12; i++) {
-        if (get_bit(board->pieceBB[i], from)) {
-            attacker = i % 6;
-            break;
-        }
-    }
-
     if (victim == -1) return 0;
 
-    return (victim * 6 - attacker) * 10000;
+    return victim * 10000;
 }
 
 int scorePosition(ChessBoard* board) {
@@ -202,6 +194,7 @@ int killer_moves[100][2];
 
 int quiescence(ChessBoard* board, int alpha, int beta, int qdepth) {
     if (qdepth <= 0) return scorePosition(board);
+    if (is_timeout()) return scorePosition(board);
 
     int stand_pat = scorePosition(board);
     if (stand_pat >= beta) return beta;
@@ -225,7 +218,6 @@ int quiescence(ChessBoard* board, int alpha, int beta, int qdepth) {
     return alpha;
 }
 
-// Optimized move ordering with captured move prioritization
 typedef struct {
     int from;
     int to;
@@ -237,6 +229,7 @@ int compare_moves(const void* a, const void* b) {
 }
 
 int search(ChessBoard* board, int depth, int alpha, int beta, int ply) {
+    if (is_timeout()) return scorePosition(board);
     if (depth == 0) return quiescence(board, alpha, beta, MAX_QUIESCENCE_DEPTH);
 
     Move dummy_move = { 0, 0, ' ' };
@@ -250,7 +243,7 @@ int search(ChessBoard* board, int depth, int alpha, int beta, int ply) {
     int movesCount = 0;
     int kingSq = get_lsb(board->pieceBB[board->side == WHITE ? K : k]);
 
-    // Generate all legal moves with scores
+    // Geração de movimentos
     for (int f = 0; f < 64; f++) {
         if (!get_bit(board->occupancy[board->side], f)) continue;
         for (int t = 0; t < 64; t++) {
@@ -283,22 +276,20 @@ int search(ChessBoard* board, int depth, int alpha, int beta, int ply) {
         return is_square_attacked(board, kingSq, !board->side) ? -100000 + ply : 0;
     }
 
-    // Sort moves using quicksort (O(n log n) instead of bubble sort O(n²))
     if (movesCount > 1) qsort(moves, movesCount, sizeof(ScoredMove), compare_moves);
 
-    // Null move pruning for non-endgame positions
-    if (depth >= NULL_MOVE_DEPTH + 2) {
+    if (depth >= NULL_MOVE_DEPTH + 2 && ply < 80) {
         int non_pawn_material = 0;
         for (int i = N; i <= Q; i++) {
             non_pawn_material += popcount64(board->pieceBB[i] | board->pieceBB[i + 6]);
         }
 
-        if (non_pawn_material > 0) {
+        if (non_pawn_material > 6) {
             int side_backup = board->side;
             board->side = !board->side;
             ChessBoard_updateOccupancy(board);
 
-            int null_score = -search(board, depth - NULL_MOVE_DEPTH - 1, -beta, -beta + 1, ply + 1);
+            int null_score = -search(board, depth - NULL_MOVE_DEPTH - 1, -beta, -alpha + 1, ply + 1);
 
             board->side = side_backup;
             ChessBoard_updateOccupancy(board);
@@ -323,16 +314,12 @@ int search(ChessBoard* board, int depth, int alpha, int beta, int ply) {
         }
 
         if (score >= beta) {
-            // Update killer moves
             if (!get_bit(board->occupancy[!board->side], moves[i].to)) {
                 killer_moves[ply][1] = killer_moves[ply][0];
                 killer_moves[ply][0] = moves[i].from | (moves[i].to << 6);
             }
 
-            // Update history heuristic
             history_table[board->side][moves[i].from][moves[i].to] += depth * depth;
-
-            // Store in transposition table
             tt_store(board->hash, beta, depth, TT_LOWER, best_move);
             return beta;
         }
@@ -356,17 +343,19 @@ Evaluate Evaluate_findBestMove(ChessBoard* board, int max_depth, int multiPvCoun
     }
 
     memset(killer_moves, 0, sizeof(killer_moves));
+    search_start_time = clock();
+    nodes_checked = 0;
 
     int best_from = -1, best_to = -1;
     int current_best_score = -1000000;
 
-    for (int current_depth = 1; current_depth <= max_depth; current_depth++) {
+    int current_depth = max_depth;
+    {
         ScoredMove moves[256];
         int movesCount = 0;
         int alpha = -1000000;
         int beta = 1000000;
 
-        // Generate root moves
         for (int f = 0; f < 64; f++) {
             if (!get_bit(board->occupancy[board->side], f)) continue;
             for (int t = 0; t < 64; t++) {
@@ -374,14 +363,13 @@ Evaluate Evaluate_findBestMove(ChessBoard* board, int max_depth, int multiPvCoun
                 if (ChessBoard_makeMove(board, f, t, ' ', &state)) {
                     moves[movesCount].from = f;
                     moves[movesCount].to = t;
-                    moves[movesCount].score = (f == best_from && t == best_to) ? 20000 : 0;
+                    moves[movesCount].score = 0;
                     ChessBoard_unmakeMove(board, &state);
                     movesCount++;
                 }
             }
         }
 
-        // Sort root moves
         if (movesCount > 1) qsort(moves, movesCount, sizeof(ScoredMove), compare_moves);
 
         for (int i = 0; i < movesCount; i++) {
@@ -409,6 +397,9 @@ Evaluate Evaluate_findBestMove(ChessBoard* board, int max_depth, int multiPvCoun
     eval.variations[0].score = current_best_score;
     eval.variations[0].depth = max_depth;
     eval.variations[0].length = 1;
+
+    double elapsed = (double)(clock() - search_start_time) / CLOCKS_PER_SEC;
+    printf("Nodes: %d, Time: %.2fs, NPS: %.0f\n", nodes_checked, elapsed, nodes_checked / elapsed);
 
     return eval;
 }
