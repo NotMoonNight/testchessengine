@@ -18,3 +18,4 @@ echo Publicando...
 git push -u origin main
 
 echo Pronto.
+@pause
